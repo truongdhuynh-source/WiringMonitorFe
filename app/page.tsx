@@ -29,7 +29,11 @@ const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:9888";
 type CompletionCommand = "from" | "to" | "both";
 type CompletionStatus = "1" | "2";
 
-function isCompletedStatus(status: string) {
+function isFinalStatus(status: string) {
+  return status === "1";
+}
+
+function isPerformedStatus(status: string) {
   return status === "1" || status === "2";
 }
 
@@ -86,7 +90,7 @@ export default function Home() {
   const wheelDeltaRef = useRef(0);
   const zoomAnchorRef = useRef<{ x: number; y: number; mouseX: number; mouseY: number } | null>(null);
   const scrollFrameRef = useRef<number | null>(null);
-  const [language, setLanguage] = useState<Language>("vi");
+  const [language, setLanguage] = useState<Language>("en");
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [result, setResult] = useState<WcdxResult | null>(null);
   const [activePageId, setActivePageId] = useState<number | null>(null);
@@ -226,9 +230,9 @@ export default function Home() {
       const response = await fetch(`${API_URL}/api/wcdx/pages`, { method: "POST", body });
       if (!response.ok) throw new Error(t.readError);
       const data = (await response.json()) as WcdxResult;
-      const firstWire = data.wires.find((wire) => !isCompletedStatus(wire.fromStatus) || !isCompletedStatus(wire.toStatus)) ?? data.wires[0];
+      const firstWire = data.wires.find((wire) => !isFinalStatus(wire.fromStatus) || !isFinalStatus(wire.toStatus)) ?? data.wires[0];
       setResult(data); setActivePageId(data.pages[0]?.pageId ?? null); setSelectedWireId(firstWire?.fromToId ?? null);
-      setCurrentSide(isCompletedStatus(firstWire?.fromStatus ?? "") ? "to" : "from"); setLogs([]); setLogState("idle");
+      setCurrentSide(isFinalStatus(firstWire?.fromStatus ?? "") ? "to" : "from"); setLogs([]); setLogState("idle");
       setLoggingEverStarted(false); setLogPromptSuppressed(false); setPendingCompletion(null);
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : t.connectError);
@@ -247,48 +251,57 @@ export default function Home() {
     if (!result) return "1";
 
     const terminal = wire[side];
-    const sameTerminalConnections = result.wires.flatMap((item) => {
-      const connections: Array<{ wire: Wire; side: "from" | "to" }> = [];
+    const endpoints = result.wires.flatMap((item) => [
+      { wire: item, side: "from" as const, terminal: item.from, status: item.fromStatus },
+      { wire: item, side: "to" as const, terminal: item.to, status: item.toStatus },
+    ]);
+    const isSameTerminal = (candidate: Terminal) =>
+      terminal.partId && terminal.termId && candidate.partId && candidate.termId
+        ? candidate.partId === terminal.partId && candidate.termId === terminal.termId
+        : candidate.deviceNum === terminal.deviceNum && candidate.termNum === terminal.termNum;
+    const sameTerminalConnections = endpoints.filter((endpoint) => isSameTerminal(endpoint.terminal));
 
-      if (
-        item.from.deviceNum === terminal.deviceNum &&
-        item.from.termNum === terminal.termNum
-      ) {
-        connections.push({ wire: item, side: "from" });
-      }
+    // A shared terminal is only finally tightened after every other wire has
+    // at least been inserted. Status 2 counts as performed, but not final.
+    if (sameTerminalConnections.length > 1) {
+      const hasOtherUnperformedConnection = sameTerminalConnections.some((endpoint) => {
+        if (endpoint.wire.fromToId === wire.fromToId && endpoint.side === side) return false;
+        return !isPerformedStatus(endpoint.status);
+      });
+      if (hasOtherUnperformedConnection) return "2";
+    }
 
-      if (
-        item.to.deviceNum === terminal.deviceNum &&
-        item.to.termNum === terminal.termNum
-      ) {
-        connections.push({ wire: item, side: "to" });
-      }
-
-      return connections;
-    });
-
-    // 作業判定:
-    // - シングル -> 本締め(1)
-    // - 共締めで最後ではない -> 仮締め(2)
-    // - 共締めの最後 -> 本締め(1)
-    if (sameTerminalConnections.length <= 1) return "1";
-
-    const hasOtherUnfinishedConnection = sameTerminalConnections.some(
-      ({ wire: item, side: itemSide }) => {
-        if (item.fromToId === wire.fromToId && itemSide === side) return false;
-        const status = itemSide === "from" ? item.fromStatus : item.toStatus;
-        return !isCompletedStatus(status);
-      },
+    // Slide 13: same device, same entry direction and within 5 mm horizontally.
+    // If a physically lower terminal in that column is not finally tightened,
+    // the current terminal remains temporarily tightened.
+    const sameColumn = endpoints.filter((endpoint) =>
+      endpoint.terminal.partId === terminal.partId &&
+      endpoint.terminal.termDirection === terminal.termDirection &&
+      Math.abs(endpoint.terminal.x - terminal.x) <= 5,
     );
+    const terminalLevel = terminal.termLevel || terminal.termHeight;
+    const lowerTerminalIds = new Set(
+      sameColumn
+        .filter((endpoint) =>
+          endpoint.terminal.termId !== terminal.termId &&
+          terminalLevel > 0 &&
+          (endpoint.terminal.termLevel || endpoint.terminal.termHeight) < terminalLevel,
+        )
+        .map((endpoint) => endpoint.terminal.termId),
+    );
+    for (const termId of lowerTerminalIds) {
+      const lowerConnections = sameColumn.filter((endpoint) => endpoint.terminal.termId === termId);
+      if (!lowerConnections.some((endpoint) => isFinalStatus(endpoint.status))) return "2";
+    }
 
-    return hasOtherUnfinishedConnection ? "2" : "1";
+    return "1";
   }
 
   function selectWire(wire: Wire) {
     setSelectedWireId(wire.fromToId);
 
     setCurrentSide(
-      !isCompletedStatus(wire.fromStatus)
+      !isFinalStatus(wire.fromStatus)
         ? "from"
         : "to"
     );
@@ -313,7 +326,10 @@ export default function Home() {
     const wire = result?.wires.find((item) => item.fromToId === id);
     if (!result || !wire) return;
     const updated = { ...wire, fromStatus, toStatus };
-    setResult({ ...result, wires: result.wires.map((item) => item.fromToId === id ? updated : item) });
+    setResult((current) => current ? {
+      ...current,
+      wires: current.wires.map((item) => item.fromToId === id ? { ...item, fromStatus, toStatus } : item),
+    } : current);
     setDirty(true); setNotice(""); addLog(action, updated, statusSymbol(fromStatus, toStatus), forceLog);
   }
 
@@ -518,7 +534,7 @@ export default function Home() {
     <main className={styles.appShell} lang={language}>
       <header className={styles.header}>
         <button className={styles.brand} onClick={resetViewer} type="button"><span className={styles.brandMark}><FileIcon /></span><span><strong>WiringMonitor</strong><small>{t.subtitle}</small></span></button>
-        <div className={styles.headerActions}>{result && <span className={styles.headerFileName} title={result.fileName}>{result.fileName}{dirty && " •"}</span>}{notice && <span className={styles.successText}>{notice}</span>}<input ref={inputRef} type="file" accept=".wcdx,.sqlite,.db" onChange={onFileChange} hidden /><div className={styles.languagePicker} aria-label="Language">{(["vi", "en", "ja"] as const).map((code) => <button type="button" key={code} className={language === code ? styles.activeLanguage : ""} onClick={() => setLanguage(code)}>{code.toUpperCase()}</button>)}</div></div>
+        <div className={styles.headerActions}>{result && <span className={styles.headerFileName} title={result.fileName}>{result.fileName}{dirty && " •"}</span>}{notice && <span className={styles.successText}>{notice}</span>}<input ref={inputRef} type="file" accept=".wcdx,.sqlite,.db" onChange={onFileChange} hidden /><div className={styles.languagePicker} aria-label="Language">{(["en", "ja"] as const).map((code) => <button type="button" key={code} className={language === code ? styles.activeLanguage : ""} onClick={() => setLanguage(code)}>{code.toUpperCase()}</button>)}</div></div>
       </header>
 
       {!result ? (
@@ -594,29 +610,10 @@ export default function Home() {
 
                   {selectedWire && currentTerminal ? (
                     <>
-                      <fieldset className={styles.tighteningSelector}>
-        
-                        <div
-                          className={`${styles.tighteningResult} ${currentCompletionStatus === "2"
-                            ? styles.temporaryTighteningResult
-                            : styles.finalTighteningResult
-                            }`}
-                        >
-                          <span className={styles.tighteningResultIcon}>
-                            {currentCompletionStatus === "2" ? "△" : "●"}
-                          </span>
-
-                          <strong>
-                            {currentCompletionStatus === "2"
-                              ? t.temporaryTightening
-                              : t.finalTightening}
-                          </strong>
-                        </div>
-                      </fieldset>
-
                       <TerminalDetails
                         terminal={currentTerminal}
                         labels={t}
+                        tighteningStatus={currentCompletionStatus}
                       />
                     </>
                   ) : (
@@ -625,7 +622,7 @@ export default function Home() {
                     </p>
                   )}
                 </section>
-                <section className={styles.wireListPanel}><div className={styles.regionTitle}>{t.wireList} <span>{result.wires.length}</span></div><div className={styles.wireTableWrap}><table className={styles.wireTable}><thead><tr><th>#</th><th>{t.status}</th><th>{t.lineNo}</th><th>{t.wire}</th><th>{t.from}</th><th>{t.to}</th><th>{t.length}</th></tr></thead><tbody>{result.wires.map((wire) => <tr key={wire.fromToId} className={wire.fromToId === selectedWireId ? styles.selectedRow : ""} onClick={() => selectWire(wire)}><td>{wire.displayOrder}</td><td className={styles.statusSymbol}>{statusSymbol(wire.fromStatus, wire.toStatus)}</td><td>{wire.lineNo || "—"}</td><td>{[wire.wireType, wire.wireSize, wire.wireColor].filter(Boolean).join(" · ") || "—"}</td><td><b>{wire.from.deviceNum}</b> / {wire.from.termNum}</td><td><b>{wire.to.deviceNum}</b> / {wire.to.termNum}</td><td>{wire.length || "—"}</td></tr>)}</tbody></table></div></section>
+                <section className={styles.wireListPanel}><div className={styles.regionTitle}>{t.wireList} <span>{result.wires.length}</span></div><div className={styles.wireTableWrap}><table className={styles.wireTable}><thead><tr><th>#</th><th>{t.status}</th><th>{t.from} {t.status}</th><th>{t.to} {t.status}</th><th>{t.lineNo}</th><th>{t.wire}</th><th>{t.from}</th><th>{t.to}</th><th>{t.length}</th></tr></thead><tbody>{result.wires.map((wire) => <tr key={wire.fromToId} className={wire.fromToId === selectedWireId ? styles.selectedRow : ""} onClick={() => selectWire(wire)}><td>{wire.displayOrder}</td><td className={styles.statusSymbol}>{statusSymbol(wire.fromStatus, wire.toStatus)}</td><td className={styles.endpointStatus} title={wire.fromStatus === "1" ? t.finalTightening : wire.fromStatus === "2" ? t.temporaryTightening : "—"}>{wire.fromStatus || "—"}</td><td className={styles.endpointStatus} title={wire.toStatus === "1" ? t.finalTightening : wire.toStatus === "2" ? t.temporaryTightening : "—"}>{wire.toStatus || "—"}</td><td>{wire.lineNo || "—"}</td><td>{[wire.wireType, wire.wireSize, wire.wireColor].filter(Boolean).join(" · ") || "—"}</td><td><b>{wire.from.deviceNum}</b> / {wire.from.termNum}</td><td><b>{wire.to.deviceNum}</b> / {wire.to.termNum}</td><td>{wire.length || "—"}</td></tr>)}</tbody></table></div></section>
               </div>
             </div>
           </div>
@@ -636,7 +633,15 @@ export default function Home() {
   );
 }
 
-function TerminalDetails({ terminal, labels }: { terminal: Terminal; labels: (typeof translations)[Language] }) {
-  const items = [[labels.terminal, terminal.termNum], [labels.part, terminal.partName], [labels.model, terminal.typeNum], [labels.terminalType, terminal.termType], [labels.terminalSize, terminal.termSize], [labels.torque, terminal.targetTorque || [terminal.minTorque, terminal.maxTorque].filter(Boolean).join(" – ")], [labels.comment, terminal.comment]];
+function TerminalDetails({ terminal, labels, tighteningStatus }: { terminal: Terminal; labels: (typeof translations)[Language]; tighteningStatus: CompletionStatus | null }) {
+  const tighteningLabel = tighteningStatus === "2" ? labels.temporaryTightening : labels.finalTightening;
+  const items = [
+    [labels.device, terminal.deviceNum],
+    [labels.mountingCoordinate, terminal.assyNum],
+    [labels.terminal, terminal.termNum],
+    [labels.tighteningType, tighteningLabel],
+    [labels.torque, terminal.targetTorque || [terminal.minTorque, terminal.maxTorque].filter(Boolean).join(" – ")],
+    [labels.terminalDiameter, terminal.termSize],
+  ];
   return <dl className={styles.terminalDetails}>{items.map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{value || "—"}</dd></div>)}</dl>;
 }

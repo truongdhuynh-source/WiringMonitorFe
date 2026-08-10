@@ -1,4 +1,4 @@
-export type Language = "vi" | "en" | "ja";
+export type Language = "en" | "ja";
 
 export type Terminal = {
   connectId: number;
